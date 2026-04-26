@@ -14,6 +14,7 @@ import time
 import threading
 import uuid
 from datetime import datetime, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
@@ -153,6 +154,28 @@ def _leader_refresh_loop():
                 _redis.expire(LEADER_KEY, LEADER_TTL)
             except Exception:
                 pass
+
+
+# ── Health check HTTP server ───────────────────────────────────────────────────
+# Permet à Railway de détecter quand l'instance est prête
+# → Railway peut alors arrêter l'ancienne instance proprement
+# → Élimine les déploiements avec 2 instances simultanées
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
+        pass  # Pas de logs HTTP
+
+
+def _start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    log.info("Health check server actif sur :%d", port)
+    server.serve_forever()
 
 # ── Redis helpers (sync wrappé en async via asyncio.to_thread) ────────────────
 
@@ -590,6 +613,9 @@ def main():
     if not try_become_leader():
         log.info("Arrêt instance follower [%s] — leader déjà actif", INSTANCE_ID)
         sys.exit(0)  # Sortie propre : Railway ne redémarre pas (ON_FAILURE policy)
+
+    # Thread health check : Railway sait que l'instance est prête → arrête l'ancienne
+    threading.Thread(target=_start_health_server, daemon=True, name="health-server").start()
 
     # Thread qui renouvelle le lock Redis toutes les 20s
     threading.Thread(target=_leader_refresh_loop, daemon=True, name="leader-lock").start()
