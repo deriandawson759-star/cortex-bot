@@ -1,2 +1,3 @@
 python-telegram-bot==21.9
 groq==0.13.1
+duckduckgo-search==6.3.7
