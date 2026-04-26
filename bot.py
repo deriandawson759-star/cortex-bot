@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
+"""
+Cortex — Bot Telegram IA Expert
+Stack : AsyncGroq · Upstash Redis · e2b · DuckDuckGo
+Fixes : async-first, rate limiting, auto-fallback modèle, anti-abus
+"""
 import logging
 import os
 import asyncio
 import json
 import re
+import time
+from datetime import datetime, timezone
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 from telegram.error import NetworkError, TimedOut, RetryAfter, Conflict
-from groq import Groq, APIConnectionError, APIStatusError, RateLimitError
+from groq import AsyncGroq, APIConnectionError, APIStatusError, RateLimitError
 
 # ── Optional dependencies ─────────────────────────────────────────────────────
 
@@ -18,12 +26,15 @@ except ImportError:
     WEB_SEARCH_AVAILABLE = False
 
 try:
-    from upstash_redis import Redis as UpstashRedis
-    _redis = UpstashRedis(
-        url=os.environ.get("UPSTASH_REDIS_URL", ""),
-        token=os.environ.get("UPSTASH_REDIS_TOKEN", ""),
-    )
-    REDIS_AVAILABLE = True
+    # Vérification stricte : URL ET token requis
+    _UPSTASH_URL   = os.environ.get("UPSTASH_REDIS_URL", "").strip()
+    _UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_TOKEN", "").strip()
+    if _UPSTASH_URL and _UPSTASH_TOKEN:
+        from upstash_redis import Redis as UpstashRedis
+        _redis = UpstashRedis(url=_UPSTASH_URL, token=_UPSTASH_TOKEN)
+        REDIS_AVAILABLE = True
+    else:
+        raise ValueError("Upstash credentials manquantes")
 except Exception:
     REDIS_AVAILABLE = False
     _redis = None
@@ -40,11 +51,15 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GROQ_API_KEY   = os.environ["GROQ_API_KEY"]
 E2B_API_KEY    = os.environ.get("E2B_API_KEY", "")
 
-MAX_HISTORY  = 50
-MAX_RETRIES  = 3
-RETRY_DELAY  = 2
-HISTORY_TTL  = 60 * 60 * 24 * 30  # 30 jours
+MAX_HISTORY      = 40       # messages max en contexte
+MAX_MSG_LEN      = 4000     # chars max par message entrant (anti-abus)
+MAX_SEARCH_CHARS = 3000     # chars max des résultats web
+MAX_RETRIES      = 3
+RETRY_DELAY      = 2        # secondes entre tentatives
+HISTORY_TTL      = 60 * 60 * 24 * 30   # 30 jours
+RATE_LIMIT_SEC   = 1.5      # délai min entre 2 messages du même user
 
+# Modèles Groq disponibles (vérifiés via API)
 MODELS = [
     "meta-llama/llama-4-scout-17b-16e-instruct",  # Llama 4 Scout — meilleur dispo
     "qwen/qwen3-32b",                              # Qwen 3 32B — très puissant
@@ -88,22 +103,36 @@ SYSTEM_PROMPT = """Tu es **Cortex**, un assistant IA de niveau expert senior ave
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
-log.info("Redis: %s | Web search: %s | e2b: %s", REDIS_AVAILABLE, WEB_SEARCH_AVAILABLE, E2B_AVAILABLE)
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+# ── État global ───────────────────────────────────────────────────────────────
 
-# In-memory cache (+ Redis pour la persistence)
-conversation_histories: dict[int, list] = {}
-user_models: dict[int, int] = {}
+# FIX #1 — AsyncGroq : appels non-bloquants, event loop libre
+groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
-# ── Redis helpers ─────────────────────────────────────────────────────────────
+conversation_histories: dict[int, list]  = {}
+user_models:            dict[int, int]   = {}
+user_last_msg:          dict[int, float] = {}  # rate limiting
+bot_start_time:         float            = time.time()
 
-def load_history(user_id: int) -> list:
+# ── Redis helpers (sync wrappé en async via asyncio.to_thread) ────────────────
+
+def _redis_get(key: str):
+    return _redis.get(key) if _redis else None
+
+def _redis_setex(key: str, ttl: int, val: str):
+    if _redis: _redis.setex(key, ttl, val)
+
+def _redis_delete(key: str):
+    if _redis: _redis.delete(key)
+
+
+async def load_history(user_id: int) -> list:
     if user_id in conversation_histories:
         return conversation_histories[user_id]
     if REDIS_AVAILABLE:
         try:
-            data = _redis.get(f"cortex:h:{user_id}")
+            # FIX #5 — Redis dans un thread pour ne pas bloquer l'event loop
+            data = await asyncio.to_thread(_redis_get, f"cortex:h:{user_id}")
             if data:
                 h = json.loads(data) if isinstance(data, str) else data
                 conversation_histories[user_id] = h
@@ -114,19 +143,20 @@ def load_history(user_id: int) -> list:
     return conversation_histories[user_id]
 
 
-def save_history(user_id: int):
+async def save_history(user_id: int):
     if REDIS_AVAILABLE:
         try:
-            _redis.setex(f"cortex:h:{user_id}", HISTORY_TTL, json.dumps(conversation_histories[user_id]))
+            payload = json.dumps(conversation_histories[user_id])
+            await asyncio.to_thread(_redis_setex, f"cortex:h:{user_id}", HISTORY_TTL, payload)
         except Exception as e:
             log.warning("Redis save error: %s", e)
 
 
-def clear_history(user_id: int):
+async def clear_history(user_id: int):
     conversation_histories[user_id] = []
     if REDIS_AVAILABLE:
         try:
-            _redis.delete(f"cortex:h:{user_id}")
+            await asyncio.to_thread(_redis_delete, f"cortex:h:{user_id}")
         except Exception as e:
             log.warning("Redis delete error: %s", e)
 
@@ -135,7 +165,6 @@ def trim_history(user_id: int):
     h = conversation_histories.get(user_id, [])
     if len(h) > MAX_HISTORY:
         conversation_histories[user_id] = h[-MAX_HISTORY:]
-        save_history(user_id)
 
 
 def get_model(user_id: int) -> str:
@@ -147,14 +176,17 @@ async def web_search(query: str, max_results: int = 5) -> str:
     if not WEB_SEARCH_AVAILABLE:
         return ""
     try:
-        loop = asyncio.get_event_loop()
+        # FIX #3 — get_running_loop() au lieu de get_event_loop() (déprécié 3.10+)
+        loop = asyncio.get_running_loop()
         def _search():
             with DDGS() as ddgs:
                 return list(ddgs.text(query, max_results=max_results))
         results = await loop.run_in_executor(None, _search)
         if not results:
             return "Aucun résultat trouvé."
-        return "\n\n".join(f"• {r['title']}\n{r['body']}\n{r['href']}" for r in results)
+        # FIX #8 mineur — limiter la taille des résultats pour le contexte
+        out = "\n\n".join(f"• {r['title']}\n{r['body']}\n{r['href']}" for r in results)
+        return out[:MAX_SEARCH_CHARS]
     except Exception as e:
         log.warning("Web search error: %s", e)
         return ""
@@ -169,7 +201,8 @@ async def execute_code(code: str) -> str:
     if not E2B_AVAILABLE or not E2B_API_KEY:
         return "❌ Exécution non disponible."
     try:
-        loop = asyncio.get_event_loop()
+        # FIX #3 — get_running_loop()
+        loop = asyncio.get_running_loop()
         def _run():
             with E2BSandbox(api_key=E2B_API_KEY) as sandbox:
                 execution = sandbox.run_code(code)
@@ -188,17 +221,20 @@ async def execute_code(code: str) -> str:
     except Exception as e:
         return f"❌ Erreur d'exécution: {e}"
 
-# ── Groq ──────────────────────────────────────────────────────────────────────
+# ── Groq async ────────────────────────────────────────────────────────────────
 
 async def call_groq(messages: list, user_id: int, extra_context: str = "") -> str:
-    model = get_model(user_id)
     system = SYSTEM_PROMPT
+    system += f"\n\n## Contexte\nDate : {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')} UTC"
     if extra_context:
         system += f"\n\n## Résultats de recherche web\n{extra_context}"
 
     for attempt in range(1, MAX_RETRIES + 1):
+        # FIX #2 — modèle récupéré À CHAQUE tentative (peut changer après switch)
+        model = get_model(user_id)
         try:
-            resp = groq_client.chat.completions.create(
+            # FIX #1 — await sur AsyncGroq : non-bloquant, event loop libre
+            resp = await groq_client.chat.completions.create(
                 model=model,
                 messages=[{"role": "system", "content": system}] + messages,
                 max_tokens=4096,
@@ -210,7 +246,7 @@ async def call_groq(messages: list, user_id: int, extra_context: str = "") -> st
         except RateLimitError:
             next_idx = (user_models.get(user_id, 0) + 1) % len(MODELS)
             user_models[user_id] = next_idx
-            log.warning("Rate limit — switch vers %s", MODELS[next_idx])
+            log.warning("Rate limit sur %s — switch vers %s", model, MODELS[next_idx])
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(RETRY_DELAY * attempt)
             else:
@@ -225,11 +261,11 @@ async def call_groq(messages: list, user_id: int, extra_context: str = "") -> st
 
         except APIStatusError as e:
             log.error("Groq API error %s: %s", e.status_code, e.message)
-            # Si le modèle n'est plus disponible → essaie le suivant
+            # Modèle indisponible → essaie le suivant (model var sera mis à jour au prochain tour)
             if e.status_code in (400, 404, 503):
                 next_idx = (user_models.get(user_id, 0) + 1) % len(MODELS)
                 user_models[user_id] = next_idx
-                log.warning("Modèle indisponible — switch vers %s", MODELS[next_idx])
+                log.warning("Modèle %s indisponible — switch vers %s", model, MODELS[next_idx])
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(RETRY_DELAY)
                     continue
@@ -240,25 +276,26 @@ async def call_groq(messages: list, user_id: int, extra_context: str = "") -> st
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 
 async def send_long(update: Update, text: str):
+    """Découpe et envoie un texte long en chunks de 4000 chars max."""
     if len(text) <= 4000:
         try:
             await update.message.reply_text(text, parse_mode="Markdown")
         except Exception:
             await update.message.reply_text(text)
         return
-    chunks = []
+
     while text:
         if len(text) <= 4000:
-            chunks.append(text)
-            break
-        split_at = text.rfind('\n\n', 0, 4000)
-        if split_at == -1:
-            split_at = text.rfind('\n', 0, 4000)
-        if split_at == -1:
-            split_at = 4000
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip()
-    for chunk in chunks:
+            chunk, text = text, ""
+        else:
+            split_at = text.rfind('\n\n', 0, 4000)
+            if split_at == -1:
+                split_at = text.rfind('\n', 0, 4000)
+            if split_at == -1:
+                split_at = 4000
+            chunk = text[:split_at]
+            text = text[split_at:].lstrip()
+
         try:
             await update.message.reply_text(chunk, parse_mode="Markdown")
         except Exception:
@@ -266,29 +303,39 @@ async def send_long(update: Update, text: str):
 
 
 async def keep_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int, stop_event: asyncio.Event):
+    """
+    FIX #6 — Sort immédiatement quand stop_event est set
+    (avant: attendait 4s complets même après arrêt)
+    """
     while not stop_event.is_set():
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         except Exception:
             pass
-        await asyncio.sleep(4)
+        try:
+            # Attend max 4s OU jusqu'à ce que stop_event soit set
+            await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+        except asyncio.TimeoutError:
+            pass  # Pas set après 4s → on renvoie "typing"
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    clear_history(user_id)
-    mem = "✅ activée (Redis)" if REDIS_AVAILABLE else "❌ désactivée"
-    e2b = "✅ activée" if E2B_AVAILABLE and E2B_API_KEY else "❌ désactivée"
+    await clear_history(user_id)
+    mem   = "✅ Redis" if REDIS_AVAILABLE else "⚠️ locale"
+    e2b   = "✅ active" if E2B_AVAILABLE and E2B_API_KEY else "❌ off"
+    model = get_model(user_id)
     await update.message.reply_text(
         "👋 *Cortex — Assistant IA Expert*\n\n"
-        "Propulsé par LLaMA 4 Scout & Qwen 3 via Groq.\n\n"
-        f"🧠 Mémoire persistante : {mem}\n"
-        f"⚙️ Exécution de code : {e2b}\n\n"
+        f"🤖 Modèle : `{model}`\n"
+        f"🧠 Mémoire : {mem}\n"
+        f"⚙️ Exécution code : {e2b}\n\n"
         "*Commandes :*\n"
         "`/web` _question_ — recherche internet\n"
         "`/run` — exécute du code Python\n"
         "`/model` — changer le modèle IA\n"
+        "`/status` — état du bot\n"
         "`/clear` — effacer l'historique\n"
         "`/help` — aide complète",
         parse_mode="Markdown",
@@ -296,8 +343,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    clear_history(update.effective_user.id)
-    await update.message.reply_text("✅ Historique effacé (Redis inclus). Nouvelle conversation !")
+    await clear_history(update.effective_user.id)
+    await update.message.reply_text("✅ Historique effacé. Nouvelle conversation !")
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -306,14 +353,36 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/start` — redémarrer\n"
         "`/clear` — effacer l'historique\n"
         "`/web` _question_ — recherche web + réponse IA\n"
-        "`/run` — exécuter du code Python (réponds à un message)\n"
+        "`/run` — exécuter du code Python\n"
         "`/model` — voir/changer le modèle IA\n"
+        "`/status` — santé du bot en temps réel\n"
         "`/help` — cette aide\n\n"
         "💡 *Astuces :*\n"
-        "• Je me souviens de tout même après redémarrage\n"
-        "• `/run` en répondant à mon message pour tester le code\n"
+        "• Mémoire persistante même après redémarrage\n"
+        "• `/run` en répondant à mon message de code\n"
         "• `/web` pour les infos récentes\n"
         "• `/clear` si le contexte devient confus",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """FIX #9 — Nouvelle commande /status pour monitorer le bot"""
+    user_id  = update.effective_user.id
+    uptime_s = int(time.time() - bot_start_time)
+    h, m, s  = uptime_s // 3600, (uptime_s % 3600) // 60, uptime_s % 60
+    hist     = conversation_histories.get(user_id, [])
+    model    = get_model(user_id)
+
+    await update.message.reply_text(
+        "📊 *Cortex — Statut*\n\n"
+        f"🟢 Uptime : `{h:02d}h {m:02d}m {s:02d}s`\n"
+        f"🤖 Modèle actif : `{model}`\n"
+        f"🧠 Redis : {'✅ connecté' if REDIS_AVAILABLE else '❌ off'}\n"
+        f"🌐 Web search : {'✅' if WEB_SEARCH_AVAILABLE else '❌'}\n"
+        f"⚙️ Code exec : {'✅' if E2B_AVAILABLE and E2B_API_KEY else '❌'}\n"
+        f"💬 Mémoire : `{len(hist)}/{MAX_HISTORY}` messages\n"
+        f"📅 `{datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')} UTC`",
         parse_mode="Markdown",
     )
 
@@ -326,7 +395,9 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
             idx = int(context.args[0]) - 1
             if 0 <= idx < len(MODELS):
                 user_models[user_id] = idx
-                await update.message.reply_text(f"✅ Modèle : `{MODELS[idx]}`", parse_mode="Markdown")
+                await update.message.reply_text(
+                    f"✅ Modèle changé :\n`{MODELS[idx]}`", parse_mode="Markdown"
+                )
             else:
                 await update.message.reply_text(f"❌ Choix : 1 à {len(MODELS)}")
         except ValueError:
@@ -334,35 +405,36 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines = [f"{i+1}. `{m}`{'  ← actuel' if m == current else ''}" for i, m in enumerate(MODELS)]
         await update.message.reply_text(
-            "*Modèles :*\n" + "\n".join(lines) + "\n\nChanger : `/model 2`",
+            "*Modèles disponibles :*\n" + "\n".join(lines) + "\n\nChanger : `/model 2`",
             parse_mode="Markdown",
         )
 
 
 async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    query = " ".join(context.args) if context.args else None
+    query   = " ".join(context.args) if context.args else None
     if not query:
         await update.message.reply_text("Usage : `/web votre question`", parse_mode="Markdown")
         return
 
-    stop_event = asyncio.Event()
-    asyncio.create_task(keep_typing(context, update.effective_chat.id, stop_event))
+    stop_event  = asyncio.Event()
+    typing_task = asyncio.create_task(keep_typing(context, update.effective_chat.id, stop_event))
     try:
         await update.message.reply_text(f"🔍 Recherche : *{query}*", parse_mode="Markdown")
         web_results = await web_search(query)
-        history = load_history(user_id)
+        history     = await load_history(user_id)
         history.append({"role": "user", "content": query})
         trim_history(user_id)
         reply = await call_groq(conversation_histories[user_id], user_id, extra_context=web_results)
         history.append({"role": "assistant", "content": reply})
-        save_history(user_id)
+        await save_history(user_id)
         await send_long(update, reply)
     except Exception as e:
         log.error("cmd_web error: %s", e, exc_info=True)
         await update.message.reply_text("❌ Erreur lors de la recherche.")
     finally:
         stop_event.set()
+        typing_task.cancel()
 
 
 async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -371,18 +443,18 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         code = " ".join(context.args)
     elif update.message.reply_to_message and update.message.reply_to_message.text:
         blocks = extract_python_blocks(update.message.reply_to_message.text)
-        code = blocks[0] if blocks else update.message.reply_to_message.text
+        code   = blocks[0] if blocks else update.message.reply_to_message.text
 
     if not code:
         await update.message.reply_text(
-            "Usage : réponds à un message contenant du code Python avec `/run`\n"
+            "Usage : réponds à un message de code avec `/run`\n"
             "Ou : `/run print('hello')`",
             parse_mode="Markdown",
         )
         return
 
-    stop_event = asyncio.Event()
-    asyncio.create_task(keep_typing(context, update.effective_chat.id, stop_event))
+    stop_event  = asyncio.Event()
+    typing_task = asyncio.create_task(keep_typing(context, update.effective_chat.id, stop_event))
     try:
         await update.message.reply_text("⚙️ Exécution en cours dans le cloud...")
         result = await execute_code(code)
@@ -391,44 +463,63 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Erreur: {e}")
     finally:
         stop_event.set()
+        typing_task.cancel()
 
 # ── Main handler ──────────────────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id   = update.effective_user.id
     user_name = update.effective_user.first_name or "User"
-    text      = update.message.text.strip()
+    text      = (update.message.text or "").strip()
     if not text:
         return
 
+    # FIX #7 — Rate limiting : anti-spam et protection quota Groq
+    now  = time.time()
+    last = user_last_msg.get(user_id, 0)
+    if now - last < RATE_LIMIT_SEC:
+        await update.message.reply_text("⏳ Un instant...")
+        return
+    user_last_msg[user_id] = now
+
+    # FIX #8 — Limite taille message entrant : protège le contexte
+    if len(text) > MAX_MSG_LEN:
+        text = text[:MAX_MSG_LEN]
+        await update.message.reply_text(f"⚠️ Message tronqué à {MAX_MSG_LEN} chars.")
+
     log.info("Message de %s (%d): %.80s", user_name, user_id, text)
 
-    history = load_history(user_id)
+    history = await load_history(user_id)
     history.append({"role": "user", "content": text})
     trim_history(user_id)
 
-    stop_event = asyncio.Event()
-    asyncio.create_task(keep_typing(context, update.effective_chat.id, stop_event))
+    stop_event  = asyncio.Event()
+    typing_task = asyncio.create_task(keep_typing(context, update.effective_chat.id, stop_event))
     try:
         reply = await call_groq(conversation_histories[user_id], user_id)
         history.append({"role": "assistant", "content": reply})
-        save_history(user_id)
+        await save_history(user_id)
         await send_long(update, reply)
-        log.info("Réponse à %s (%d) — %d chars", user_name, user_id, len(reply))
+        log.info("Réponse à %s (%d) — %d chars | modèle: %s",
+                 user_name, user_id, len(reply), get_model(user_id))
 
     except RateLimitError:
-        await update.message.reply_text("⚠️ Limite atteinte. Réessaie dans 30 secondes.")
-        history.pop()
+        await update.message.reply_text("⚠️ Quota Groq atteint. Réessaie dans 30 secondes.")
+        if history: history.pop()  # FIX #4 — vérif avant pop()
+
     except (APIConnectionError, APIStatusError) as e:
         log.error("Groq error pour %d: %s", user_id, e)
-        await update.message.reply_text("❌ Erreur IA. Réessaie dans quelques secondes.")
-        history.pop()
+        await update.message.reply_text("❌ Erreur IA temporaire. Réessaie dans quelques secondes.")
+        if history: history.pop()  # FIX #4
+
     except Exception as e:
         log.error("Erreur inattendue pour %d: %s", user_id, e, exc_info=True)
         await update.message.reply_text("❌ Erreur inattendue. Tape /clear puis réessaie.")
-        history.pop()
+        if history: history.pop()  # FIX #4
+
     finally:
         stop_event.set()
+        typing_task.cancel()  # FIX #6 — annulation explicite de la tâche
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -440,8 +531,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         log.warning("Rate limit Telegram — attente %ds", err.retry_after)
         await asyncio.sleep(err.retry_after)
     elif isinstance(err, Conflict):
-        # 409 : deux instances tournent (ex: redéploiement Railway)
-        # On attend et Railway tuera l'ancienne instance automatiquement
+        # 409 : deux instances (ex: redéploiement Railway) → attendre que l'ancienne meure
         log.warning("409 Conflict — autre instance détectée, pause 15s...")
         await asyncio.sleep(15)
     else:
@@ -450,7 +540,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    log.info("Démarrage Cortex (modèle: %s)", MODELS[0])
+    log.info("═" * 60)
+    log.info("Cortex démarrage | Redis:%s | WebSearch:%s | E2B:%s",
+             REDIS_AVAILABLE, WEB_SEARCH_AVAILABLE, E2B_AVAILABLE)
+    log.info("Modèle principal : %s", MODELS[0])
+    log.info("═" * 60)
+
     app = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
@@ -460,16 +555,23 @@ def main():
         .pool_timeout(10)
         .build()
     )
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("clear", cmd_clear))
-    app.add_handler(CommandHandler("help",  cmd_help))
-    app.add_handler(CommandHandler("model", cmd_model))
-    app.add_handler(CommandHandler("web",   cmd_web))
-    app.add_handler(CommandHandler("run",   cmd_run))
+
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("clear",  cmd_clear))
+    app.add_handler(CommandHandler("help",   cmd_help))
+    app.add_handler(CommandHandler("model",  cmd_model))
+    app.add_handler(CommandHandler("web",    cmd_web))
+    app.add_handler(CommandHandler("run",    cmd_run))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
+
     log.info("Cortex prêt — polling Telegram")
-    app.run_polling(drop_pending_updates=True, allowed_updates=["message"])
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message"],
+        timeout=20,
+    )
 
 
 if __name__ == "__main__":
