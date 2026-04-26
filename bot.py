@@ -623,24 +623,29 @@ def main():
     app.add_error_handler(error_handler)
 
     # ── Mode WEBHOOK (production) ou POLLING (local) ───────────────────────────
-    DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
-    PORT   = int(os.environ.get("PORT", 8080))
+    # WEBHOOK_URL défini → mode webhook (production Railway)
+    # Sinon → mode polling (développement local)
+    WEBHOOK_URL = (
+        os.environ.get("WEBHOOK_URL", "")
+        or (f"https://{d}" if (d := os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")) else "")
+    )
+    PORT = int(os.environ.get("PORT", 8080))
 
-    if DOMAIN:
-        # WEBHOOK — Telegram pousse les messages vers notre URL
-        # → Aucun polling, aucun 409 Conflict possible, même avec N instances
-        log.info("Mode WEBHOOK actif : https://%s (port %d)", DOMAIN, PORT)
+    if WEBHOOK_URL:
+        # WEBHOOK — Telegram envoie les messages vers notre URL
+        # → Pas de polling → 409 Conflict IMPOSSIBLE même avec N instances
+        log.info("Mode WEBHOOK : %s (port %d)", WEBHOOK_URL, PORT)
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             url_path="",
-            webhook_url=f"https://{DOMAIN}",
+            webhook_url=WEBHOOK_URL,
             drop_pending_updates=True,
             allowed_updates=["message"],
         )
     else:
-        # POLLING — mode développement local uniquement
-        log.info("Mode POLLING (local dev — pas de domaine Railway détecté)")
+        # POLLING — développement local uniquement
+        log.info("Mode POLLING (local — pas de WEBHOOK_URL)")
         app.run_polling(
             drop_pending_updates=True,
             allowed_updates=["message"],
