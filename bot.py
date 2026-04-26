@@ -558,29 +558,15 @@ def main() -> None:
     )
     port = int(os.environ.get("PORT", 8080))
 
-    # post_init : enregistre le webhook UNE SEULE FOIS après initialisation du bot.
-    # run_webhook() est appelé avec webhook_url=None pour que PTB ne touche
-    # JAMAIS au webhook (pas de deleteWebhook au démarrage → plus de webhook vide).
-    async def _register_webhook(application) -> None:
-        await application.bot.set_webhook(
-            url=webhook_url,
-            allowed_updates=["message"],
-            drop_pending_updates=True,
-        )
-        log.info("✅ Webhook enregistré : %s", webhook_url)
-
-    builder = (
+    app = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
         .connect_timeout(10)
         .read_timeout(30)
         .write_timeout(30)
         .pool_timeout(10)
+        .build()
     )
-    if webhook_url:
-        builder = builder.post_init(_register_webhook)
-
-    app = builder.build()
 
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("clear",  cmd_clear))
@@ -598,8 +584,8 @@ def main() -> None:
             listen="0.0.0.0",
             port=port,
             url_path="",
-            webhook_url=None,          # PTB ne gère PAS le webhook
-            drop_pending_updates=False, # PTB n'appelle PAS deleteWebhook
+            webhook_url=webhook_url,
+            drop_pending_updates=True,
             allowed_updates=["message"],
         )
     else:
