@@ -46,8 +46,10 @@ RETRY_DELAY  = 2
 HISTORY_TTL  = 60 * 60 * 24 * 30  # 30 jours
 
 MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",  # Llama 4 Maverick — meilleur
+    "meta-llama/llama-4-scout-17b-16e-instruct",       # Llama 4 Scout — rapide
+    "llama-3.3-70b-versatile",                          # Llama 3.3 — fallback
+    "llama-3.1-8b-instant",                             # Llama 3.1 — ultra-rapide
 ]
 
 SYSTEM_PROMPT = """Tu es **Cortex**, un assistant IA de niveau expert senior avec 20+ ans d'expérience tech.
@@ -223,6 +225,14 @@ async def call_groq(messages: list, user_id: int, extra_context: str = "") -> st
 
         except APIStatusError as e:
             log.error("Groq API error %s: %s", e.status_code, e.message)
+            # Si le modèle n'est plus disponible → essaie le suivant
+            if e.status_code in (400, 404, 503):
+                next_idx = (user_models.get(user_id, 0) + 1) % len(MODELS)
+                user_models[user_id] = next_idx
+                log.warning("Modèle indisponible — switch vers %s", MODELS[next_idx])
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(RETRY_DELAY)
+                    continue
             raise
 
     raise RuntimeError("Groq: toutes les tentatives ont échoué")
@@ -272,7 +282,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     e2b = "✅ activée" if E2B_AVAILABLE and E2B_API_KEY else "❌ désactivée"
     await update.message.reply_text(
         "👋 *Cortex — Assistant IA Expert*\n\n"
-        "Propulsé par LLaMA 3.3 70B via Groq.\n\n"
+        "Propulsé par LLaMA 4 Maverick via Groq.\n\n"
         f"🧠 Mémoire persistante : {mem}\n"
         f"⚙️ Exécution de code : {e2b}\n\n"
         "*Commandes :*\n"
