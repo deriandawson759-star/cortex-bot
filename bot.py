@@ -9,10 +9,7 @@ import os
 import asyncio
 import json
 import re
-import sys
 import time
-import threading
-import uuid
 from datetime import datetime, timezone
 
 from telegram import Update
@@ -117,42 +114,6 @@ user_models:            dict[int, int]   = {}
 user_last_msg:          dict[int, float] = {}  # rate limiting
 bot_start_time:         float            = time.time()
 
-# ── Leader election (anti-409 Conflict) ───────────────────────────────────────
-# Garantit qu'une seule instance poll Telegram à la fois
-# Si Railway démarre 2 répliques, seule la première devient leader
-
-INSTANCE_ID = str(uuid.uuid4())[:8]  # ID unique par instance
-LEADER_KEY  = "cortex:leader"
-LEADER_TTL  = 45  # secondes
-
-
-def try_become_leader() -> bool:
-    """Tente d'acquérir le lock de leader via Redis (SET NX EX)."""
-    if not REDIS_AVAILABLE:
-        log.warning("Redis non disponible — polling sans leader lock")
-        return True
-    try:
-        result = _redis.set(LEADER_KEY, INSTANCE_ID, nx=True, ex=LEADER_TTL)
-        if result:
-            log.info("Instance [%s] est LEADER — polling démarré", INSTANCE_ID)
-            return True
-        existing = _redis.get(LEADER_KEY) or "?"
-        log.warning("Instance [%s] est FOLLOWER (leader: %s) — arrêt propre", INSTANCE_ID, existing)
-        return False
-    except Exception as e:
-        log.warning("Leader election error: %s — fallback polling", e)
-        return True
-
-
-def _leader_refresh_loop():
-    """Thread background : renouvelle le lock toutes les 20s tant qu'on est leader."""
-    while True:
-        time.sleep(20)
-        if REDIS_AVAILABLE:
-            try:
-                _redis.expire(LEADER_KEY, LEADER_TTL)
-            except Exception:
-                pass
 
 
 # ── Health check HTTP server ───────────────────────────────────────────────────
@@ -588,19 +549,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     log.info("═" * 60)
-    log.info("Cortex démarrage [instance:%s] | Redis:%s | WebSearch:%s | E2B:%s",
-             INSTANCE_ID, REDIS_AVAILABLE, WEB_SEARCH_AVAILABLE, E2B_AVAILABLE)
+    log.info("Cortex démarrage | Redis:%s | WebSearch:%s | E2B:%s",
+             REDIS_AVAILABLE, WEB_SEARCH_AVAILABLE, E2B_AVAILABLE)
     log.info("Modèle principal : %s", MODELS[0])
     log.info("═" * 60)
-
-    # ── Leader election : 1 seule instance poll à la fois ─────────────────────
-    if not try_become_leader():
-        log.info("Arrêt instance follower [%s] — leader déjà actif", INSTANCE_ID)
-        sys.exit(0)  # Sortie propre : Railway ne redémarre pas (ON_FAILURE policy)
-
-    # Thread de renouvellement du lock Redis toutes les 20s
-    threading.Thread(target=_leader_refresh_loop, daemon=True, name="leader-lock").start()
-    log.info("Leader lock actif [%s] — refresh toutes les 20s", INSTANCE_ID)
 
     app = (
         ApplicationBuilder()
