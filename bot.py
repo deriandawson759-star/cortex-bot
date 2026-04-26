@@ -6,7 +6,7 @@ import json
 import re
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
-from telegram.error import NetworkError, TimedOut, RetryAfter
+from telegram.error import NetworkError, TimedOut, RetryAfter, Conflict
 from groq import Groq, APIConnectionError, APIStatusError, RateLimitError
 
 # ── Optional dependencies ─────────────────────────────────────────────────────
@@ -46,10 +46,10 @@ RETRY_DELAY  = 2
 HISTORY_TTL  = 60 * 60 * 24 * 30  # 30 jours
 
 MODELS = [
-    "meta-llama/llama-4-maverick-17b-128e-instruct",  # Llama 4 Maverick — meilleur
-    "meta-llama/llama-4-scout-17b-16e-instruct",       # Llama 4 Scout — rapide
-    "llama-3.3-70b-versatile",                          # Llama 3.3 — fallback
-    "llama-3.1-8b-instant",                             # Llama 3.1 — ultra-rapide
+    "meta-llama/llama-4-scout-17b-16e-instruct",  # Llama 4 Scout — meilleur dispo
+    "qwen/qwen3-32b",                              # Qwen 3 32B — très puissant
+    "llama-3.3-70b-versatile",                     # Llama 3.3 70B — fiable
+    "llama-3.1-8b-instant",                        # Llama 3.1 — ultra-rapide
 ]
 
 SYSTEM_PROMPT = """Tu es **Cortex**, un assistant IA de niveau expert senior avec 20+ ans d'expérience tech.
@@ -282,7 +282,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     e2b = "✅ activée" if E2B_AVAILABLE and E2B_API_KEY else "❌ désactivée"
     await update.message.reply_text(
         "👋 *Cortex — Assistant IA Expert*\n\n"
-        "Propulsé par LLaMA 4 Maverick via Groq.\n\n"
+        "Propulsé par LLaMA 4 Scout & Qwen 3 via Groq.\n\n"
         f"🧠 Mémoire persistante : {mem}\n"
         f"⚙️ Exécution de code : {e2b}\n\n"
         "*Commandes :*\n"
@@ -434,10 +434,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if isinstance(err, (NetworkError, TimedOut)):
-        log.warning("Erreur réseau: %s", err)
+        log.warning("Erreur réseau (transitoire): %s", err)
+        await asyncio.sleep(2)
     elif isinstance(err, RetryAfter):
         log.warning("Rate limit Telegram — attente %ds", err.retry_after)
         await asyncio.sleep(err.retry_after)
+    elif isinstance(err, Conflict):
+        # 409 : deux instances tournent (ex: redéploiement Railway)
+        # On attend et Railway tuera l'ancienne instance automatiquement
+        log.warning("409 Conflict — autre instance détectée, pause 15s...")
+        await asyncio.sleep(15)
     else:
         log.error("Erreur non gérée: %s", err, exc_info=context.error)
 
