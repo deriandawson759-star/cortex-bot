@@ -14,7 +14,6 @@ import time
 import threading
 import uuid
 from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
@@ -161,21 +160,6 @@ def _leader_refresh_loop():
 # → Railway peut alors arrêter l'ancienne instance proprement
 # → Élimine les déploiements avec 2 instances simultanées
 
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, *args):
-        pass  # Pas de logs HTTP
-
-
-def _start_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
-    log.info("Health check server actif sur :%d", port)
-    server.serve_forever()
 
 # ── Redis helpers (sync wrappé en async via asyncio.to_thread) ────────────────
 
@@ -614,10 +598,7 @@ def main():
         log.info("Arrêt instance follower [%s] — leader déjà actif", INSTANCE_ID)
         sys.exit(0)  # Sortie propre : Railway ne redémarre pas (ON_FAILURE policy)
 
-    # Thread health check : Railway sait que l'instance est prête → arrête l'ancienne
-    threading.Thread(target=_start_health_server, daemon=True, name="health-server").start()
-
-    # Thread qui renouvelle le lock Redis toutes les 20s
+    # Thread de renouvellement du lock Redis toutes les 20s
     threading.Thread(target=_leader_refresh_loop, daemon=True, name="leader-lock").start()
     log.info("Leader lock actif [%s] — refresh toutes les 20s", INSTANCE_ID)
 
@@ -641,12 +622,30 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    log.info("Cortex prêt — polling Telegram")
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=["message"],
-        timeout=20,
-    )
+    # ── Mode WEBHOOK (production) ou POLLING (local) ───────────────────────────
+    DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+    PORT   = int(os.environ.get("PORT", 8080))
+
+    if DOMAIN:
+        # WEBHOOK — Telegram pousse les messages vers notre URL
+        # → Aucun polling, aucun 409 Conflict possible, même avec N instances
+        log.info("Mode WEBHOOK actif : https://%s (port %d)", DOMAIN, PORT)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="",
+            webhook_url=f"https://{DOMAIN}",
+            drop_pending_updates=True,
+            allowed_updates=["message"],
+        )
+    else:
+        # POLLING — mode développement local uniquement
+        log.info("Mode POLLING (local dev — pas de domaine Railway détecté)")
+        app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=["message"],
+            timeout=20,
+        )
 
 
 if __name__ == "__main__":
