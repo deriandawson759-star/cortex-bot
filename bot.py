@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Cortex — Bot Telegram IA Expert
-Stack  : python-telegram-bot 21 (webhook) · AsyncGroq · Upstash Redis · e2b · DuckDuckGo
-Mode   : WEBHOOK en production (Railway), POLLING en local
+Stack  : python-telegram-bot 21 · AsyncGroq · Upstash Redis · e2b · DuckDuckGo
+Mode   : POLLING (deleteWebhook automatique au démarrage)
 """
 import asyncio
 import json
@@ -527,12 +527,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     err = context.error
     if isinstance(err, (NetworkError, TimedOut)):
         log.warning("Erreur réseau (transitoire) : %s", err)
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
     elif isinstance(err, RetryAfter):
         log.warning("Rate limit Telegram — pause %ds", err.retry_after)
         await asyncio.sleep(err.retry_after)
     elif isinstance(err, Conflict):
-        log.warning("409 Conflict — instance dupliquée détectée")
+        # Pendant le rolling deploy Railway : l'ancienne instance est encore en vie.
+        # On attend 30s — Railway la tue via SIGTERM dans ce délai.
+        log.warning("409 Conflict — ancienne instance active, pause 30s...")
+        await asyncio.sleep(30)
     else:
         log.error("Erreur non gérée : %s", err, exc_info=True)
 
@@ -546,17 +549,6 @@ def main() -> None:
     )
     log.info("Modèle principal : %s", MODELS[0])
     log.info("═" * 60)
-
-    # Webhook URL : variable d'env explicite > domaine Railway automatique
-    webhook_url = (
-        os.environ.get("WEBHOOK_URL", "").strip()
-        or (
-            f"https://{d}"
-            if (d := os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip())
-            else ""
-        )
-    )
-    port = int(os.environ.get("PORT", 8080))
 
     app = (
         ApplicationBuilder()
@@ -578,23 +570,16 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    if webhook_url:
-        log.info("Mode WEBHOOK : %s (port %d)", webhook_url, port)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path="",
-            webhook_url=webhook_url,
-            drop_pending_updates=True,
-            allowed_updates=["message"],
-        )
-    else:
-        log.info("Mode POLLING (développement local)")
-        app.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=["message"],
-            timeout=20,
-        )
+    # Mode POLLING — simple, fiable, aucun webhook à gérer.
+    # run_polling() appelle deleteWebhook automatiquement au démarrage.
+    # En cas de 409 Conflict (rolling deploy Railway), l'error handler
+    # attend 30s que l'ancienne instance soit tuée, puis reprend.
+    log.info("Mode POLLING actif")
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message"],
+        timeout=10,
+    )
 
 
 if __name__ == "__main__":
