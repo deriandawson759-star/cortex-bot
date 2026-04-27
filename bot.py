@@ -12,6 +12,8 @@ import re
 import time
 from datetime import datetime, timezone
 
+import httpx
+
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -51,9 +53,14 @@ except ImportError:
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GROQ_API_KEY   = os.environ["GROQ_API_KEY"]
-E2B_API_KEY    = os.environ.get("E2B_API_KEY", "")
+TELEGRAM_TOKEN      = os.environ["TELEGRAM_TOKEN"]
+GROQ_API_KEY        = os.environ["GROQ_API_KEY"]
+E2B_API_KEY         = os.environ.get("E2B_API_KEY", "")
+FLOWISE_URL         = os.environ.get("FLOWISE_URL", "").rstrip("/")
+FLOWISE_CHATFLOW_ID = os.environ.get("FLOWISE_CHATFLOW_ID", "")
+N8N_WEBHOOK_URL     = os.environ.get("N8N_WEBHOOK_URL", "")
+FLOWISE_AVAILABLE   = bool(FLOWISE_URL and FLOWISE_CHATFLOW_ID)
+N8N_AVAILABLE       = bool(N8N_WEBHOOK_URL)
 
 MAX_HISTORY      = 40
 MAX_MSG_LEN      = 4000
@@ -280,6 +287,47 @@ async def call_groq(messages: list, user_id: int, extra_context: str = "") -> st
 
     raise RuntimeError("Groq : toutes les tentatives ont échoué")
 
+# ── Flowise ───────────────────────────────────────────────────────────────────
+
+async def call_flowise(question: str, session_id: str) -> str:
+    url = f"{FLOWISE_URL}/api/v1/prediction/{FLOWISE_CHATFLOW_ID}"
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(url, json={"question": question, "sessionId": session_id})
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("text") or data.get("answer") or str(data)
+    except httpx.TimeoutException:
+        return "⏱️ Flowise timeout — l'agent met trop de temps à répondre."
+    except Exception as e:
+        log.error("Flowise error: %s", e)
+        return f"❌ Erreur Flowise : {e}"
+
+
+# ── n8n ───────────────────────────────────────────────────────────────────────
+
+async def trigger_n8n(user_id: int, user_name: str, task: str) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(N8N_WEBHOOK_URL, json={
+                "user_id": user_id,
+                "user_name": user_name,
+                "task": task,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+                return data.get("message") or data.get("result") or "✅ Automation déclenchée."
+            except Exception:
+                return "✅ Automation déclenchée."
+    except httpx.TimeoutException:
+        return "⏱️ n8n timeout — le workflow prend trop de temps."
+    except Exception as e:
+        log.error("n8n error: %s", e)
+        return f"❌ Erreur n8n : {e}"
+
+
 # ── Utilitaires Telegram ──────────────────────────────────────────────────────
 
 async def send_long(update: Update, text: str) -> None:
@@ -329,8 +377,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 *Cortex — Assistant IA Expert*\n\n"
         f"🤖 Modèle : `{get_model(user_id)}`\n"
         f"🧠 Mémoire : {'✅ Redis' if REDIS_AVAILABLE else '⚠️ locale'}\n"
-        f"⚙️ Exécution code : {'✅ active' if E2B_AVAILABLE and E2B_API_KEY else '❌ off'}\n\n"
+        f"⚙️ Exécution code : {'✅ active' if E2B_AVAILABLE and E2B_API_KEY else '❌ off'}\n"
+        f"🔗 Flowise : {'✅ connecté' if FLOWISE_AVAILABLE else '❌ off'}\n"
+        f"⚡ n8n : {'✅ connecté' if N8N_AVAILABLE else '❌ off'}\n\n"
         "*Commandes :*\n"
+        "`/expert` _question_ — agent IA Flowise\n"
+        "`/auto` _tâche_ — déclencher n8n\n"
         "`/web` _question_ — recherche internet\n"
         "`/run` — exécute du code Python\n"
         "`/model` — changer le modèle IA\n"
@@ -377,6 +429,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"🧠 Redis : {'✅ connecté' if REDIS_AVAILABLE else '❌ off'}\n"
         f"🌐 Web search : {'✅' if WEB_SEARCH_AVAILABLE else '❌'}\n"
         f"⚙️ Code exec : {'✅' if E2B_AVAILABLE and E2B_API_KEY else '❌'}\n"
+        f"🔗 Flowise : {'✅ connecté' if FLOWISE_AVAILABLE else '❌ off'}\n"
+        f"⚡ n8n : {'✅ connecté' if N8N_AVAILABLE else '❌ off'}\n"
         f"💬 Mémoire : `{hist_len}/{MAX_HISTORY}` messages\n"
         f"📅 `{datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')} UTC`",
         parse_mode="Markdown",
@@ -408,6 +462,54 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "*Modèles disponibles :*\n" + "\n".join(lines) + "\n\nChanger : `/model 2`",
             parse_mode="Markdown",
         )
+
+
+async def cmd_expert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not FLOWISE_AVAILABLE:
+        await update.message.reply_text("❌ Flowise non configuré (FLOWISE_URL / FLOWISE_CHATFLOW_ID manquants).")
+        return
+    user_id  = update.effective_user.id
+    question = " ".join(context.args).strip() if context.args else ""
+    if not question:
+        await update.message.reply_text("Usage : `/expert votre question`", parse_mode="Markdown")
+        return
+
+    stop   = asyncio.Event()
+    typing = asyncio.create_task(keep_typing(context, update.effective_chat.id, stop))
+    try:
+        await update.message.reply_text("🧠 Agent Flowise en cours...", parse_mode="Markdown")
+        reply = await call_flowise(question, session_id=str(user_id))
+        await send_long(update, reply)
+    except Exception as e:
+        log.error("cmd_expert error: %s", e)
+        await update.message.reply_text(f"❌ Erreur : {e}")
+    finally:
+        stop.set()
+        typing.cancel()
+
+
+async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not N8N_AVAILABLE:
+        await update.message.reply_text("❌ n8n non configuré (N8N_WEBHOOK_URL manquant).")
+        return
+    user    = update.effective_user
+    task    = " ".join(context.args).strip() if context.args else ""
+    if not task:
+        await update.message.reply_text("Usage : `/auto votre tâche à automatiser`", parse_mode="Markdown")
+        return
+
+    stop   = asyncio.Event()
+    typing = asyncio.create_task(keep_typing(context, update.effective_chat.id, stop))
+    try:
+        await update.message.reply_text("⚡ Déclenchement n8n...", parse_mode="Markdown")
+        result = await trigger_n8n(user.id, user.first_name or "User", task)
+        await send_long(update, result)
+    except Exception as e:
+        log.error("cmd_auto error: %s", e)
+        await update.message.reply_text(f"❌ Erreur : {e}")
+    finally:
+        stop.set()
+        typing.cancel()
 
 
 async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -567,6 +669,8 @@ def main() -> None:
     app.add_handler(CommandHandler("web",    cmd_web))
     app.add_handler(CommandHandler("run",    cmd_run))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("expert", cmd_expert))
+    app.add_handler(CommandHandler("auto",   cmd_auto))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
